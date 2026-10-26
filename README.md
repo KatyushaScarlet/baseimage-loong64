@@ -33,6 +33,30 @@ This container includes the bare minimum packages for Authelia to function in a 
 * tzdata
 * wget
 
+## Architectures
+
+The `linux/amd64`, `linux/arm/v7` and `linux/arm64` images are assembled from the [Ubuntu] archive that
+[Chisel] slices, which is also where the BusyBox source they compile is taken from.
+
+The `linux/loong64` image is assembled by [Dockerfile.loong64] from the [Debian] unstable (`sid`) archive instead,
+because [Ubuntu] does not publish a loong64 archive while [Debian] maintains the LoongArch port. The package
+selection is the equivalent of the Chisel slices used for the other three architectures, the BusyBox binary is the
+one [Debian] publishes for loong64, and `su-exec` is compiled from source like it is for the other architectures.
+
+The assembly runs the resulting root filesystem in a chroot for the BusyBox applet installation and the smoke test, so
+the image the assembly runs in has to provide a [Debian] loong64 userland. This is the same requirement the other
+architectures have whenever they are built on a host of a different architecture, which is why
+`Dockerfile.loong64` takes the assembly image as the `ASSEMBLY_IMAGE` build argument:
+
+```shell
+docker buildx build --file Dockerfile.loong64 --platform linux/loong64 -t authelia/base:latest .
+```
+
+[Ubuntu]: https://ubuntu.com/
+[Debian]: https://www.debian.org/
+[Chisel]: https://github.com/canonical/chisel
+[Dockerfile.loong64]: ./Dockerfile.loong64
+
 ## Version
 - **30/09/2026:** Update busybox to v1.38.0-3ubuntu3 and chisel to v1.5.1
 - **07/09/2026:** Update busybox to v1.38.0-3ubuntu1 and chisel to v1.5.0

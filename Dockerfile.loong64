@@ -1,0 +1,187 @@
+# SPDX-FileCopyrightText: 2026 Authelia
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# ==============================================
+# ===== Authelia base image (linux/loong64) ====
+# ==============================================
+#
+# The linux/amd64, linux/arm/v7 and linux/arm64 images are assembled by ./Dockerfile from the binaries Ubuntu
+# publishes for those architectures, sliced with Canonical chisel. Ubuntu does not publish a loong64 archive, so this
+# image is assembled from the equivalent Debian unstable (sid) loong64 archive instead, which is where the LoongArch
+# port is maintained and published. Everything else is assembled the same way: a from-scratch image which only
+# contains the files Authelia needs at runtime.
+#
+# Every step below extracts loong64 packages or executes the assembled root filesystem in a chroot, so the image the
+# assembly runs in has to provide a Debian loong64 userland. Build it on a loong64 host, or on a host which has the
+# loong64 binfmt interpreter registered, e.g. docker run --privileged --rm tonistiigi/binfmt --install loong64 which
+# is the same requirement the linux/arm/v7 and linux/arm64 variants have.
+
+ARG ASSEMBLY_IMAGE=ghcr.io/lat-opensource/latx-runner-debian:loong64
+
+FROM ${ASSEMBLY_IMAGE} AS assemble
+
+ARG TARGETARCH
+
+ARG DEBIAN_SUITE="sid"
+ARG DEBIAN_MIRROR="http://deb.debian.org/debian"
+ARG DEBIAN_KEYRING="/usr/share/keyrings/debian-archive-keyring.gpg"
+ARG SUEXEC_RELEASE="0.3"
+
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /root-fs
+
+# Download the packages which make up the root filesystem. They are the Debian equivalents of the chisel slices the
+# other architectures are assembled from:
+#
+#   base-files_base base-files_release-info -> base-files
+#   base-passwd_data                        -> base-passwd
+#   ca-certificates_data                    -> ca-certificates
+#   libc-bin_nsswitch libc-bin              -> libc6 libc-bin
+#   tzdata_zoneinfo                         -> tzdata
+#   wget_bins                               -> wget
+#
+# busybox is not built from source here like it is for the other architectures: Debian already publishes a loong64
+# binary and keeps it patched, so the published binary is used as-is. The dependency closure is resolved against an
+# empty dpkg status file so the assembly image contributes nothing to the selection, which is the same closure chisel
+# computes when it resolves the dependencies of a slice.
+RUN <<EOF
+    set -euxo pipefail
+
+    [ "${TARGETARCH}" = "loong64" ]
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    rm -rf /etc/apt/sources.list /etc/apt/sources.list.d
+
+    echo "deb [arch=${TARGETARCH} signed-by=${DEBIAN_KEYRING}] ${DEBIAN_MIRROR} ${DEBIAN_SUITE} main" > /etc/apt/sources.list
+
+    apt-get update
+
+    : > /tmp/dpkg-status
+
+    apt-get install --yes --download-only --no-install-recommends -o Dir::State::status=/tmp/dpkg-status \
+        base-files base-passwd busybox libc6 libc-bin tzdata wget
+
+    # ca-certificates only contributes data. The openssl it depends on exists for the update-ca-certificates
+    # maintainer script, which does not run against the assembled root filesystem, so the package is fetched on its own
+    # rather than dragging a TLS toolchain the image never uses into it.
+    cd /var/cache/apt/archives
+
+    apt-get download ca-certificates
+EOF
+
+# Unpack the downloaded packages. dpkg-deb --extract only writes the data of the package, so the maintainer scripts
+# of the archive are never executed against the assembled root filesystem: whatever they would have generated and
+# which is needed at runtime is generated below explicitly.
+RUN <<EOF
+    set -euxo pipefail
+
+    mkdir -p /root-fs
+
+    for deb in /var/cache/apt/archives/*.deb; do
+        dpkg-deb --extract "${deb}" /root-fs
+    done
+
+    # update-ca-certificates generates this bundle from a maintainer script; concatenating the certificates the
+    # package ships produces the identical file.
+    mkdir -p /root-fs/etc/ssl/certs
+    cat /root-fs/usr/share/ca-certificates/mozilla/*.crt > /root-fs/etc/ssl/certs/ca-certificates.crt
+
+    # Debian is a merged-/usr distribution, so /bin is a symlink to /usr/bin and busybox is reachable from the same
+    # path as it is in the other architectures.
+    [ -L /root-fs/bin ]
+
+    # base-passwd and libc-bin ship the databases and the NSS configuration as data and their maintainer scripts
+    # install them as the initial /etc/passwd, /etc/group and /etc/nsswitch.conf of a new system, which is what the
+    # base-passwd_data and libc-bin_nsswitch slices of the other architectures contain.
+    install --mode 0644 /root-fs/usr/share/base-passwd/passwd.master /root-fs/etc/passwd
+    install --mode 0644 /root-fs/usr/share/base-passwd/group.master /root-fs/etc/group
+    install --mode 0644 /root-fs/usr/share/libc-bin/nsswitch.conf /root-fs/etc/nsswitch.conf
+
+    # Only needed while the package would be installed, for documentation, or by tools which are not part of the image.
+    rm -rf /root-fs/usr/share/base-passwd /root-fs/usr/share/libc-bin \
+        /root-fs/usr/share/common-licenses /root-fs/usr/share/ca-certificates /root-fs/usr/share/debconf \
+        /root-fs/usr/share/doc /root-fs/usr/share/info /root-fs/usr/share/locale /root-fs/usr/share/man \
+        /root-fs/usr/share/perl5 /root-fs/usr/share/initramfs-tools /root-fs/usr/share/lintian \
+        /root-fs/usr/lib/*/gconv /root-fs/usr/lib/locale /root-fs/usr/sbin/update-passwd \
+        /root-fs/var/cache/apt /root-fs/var/lib/apt /root-fs/var/log/apt \
+        /root-fs/etc/apt /root-fs/etc/initramfs-tools
+
+    chroot /root-fs /sbin/ldconfig
+EOF
+
+# su-exec is not packaged by Debian, so it is built from source exactly like it is for the other architectures.
+RUN <<EOF
+    set -euxo pipefail
+
+    curl -fsSL "https://github.com/ncopa/su-exec/archive/refs/tags/v${SUEXEC_RELEASE}.tar.gz" | tar -xz -C /tmp
+
+    make -C /tmp/su-exec-${SUEXEC_RELEASE}
+
+    install --directory /root-fs/sbin
+    install --mode 0755 /tmp/su-exec-${SUEXEC_RELEASE}/su-exec /root-fs/sbin/su-exec
+
+    rm -rf /tmp/su-exec-${SUEXEC_RELEASE}
+EOF
+
+RUN <<EOF
+    set -euxo pipefail
+
+    chroot /root-fs /bin/busybox --install -s /bin
+EOF
+
+# The smoke test the other architectures run, so a broken root filesystem never reaches an Authelia image.
+RUN --network=none <<EOF
+    set -euxo pipefail
+
+    cp -a /root-fs /smoke-test
+    mkdir -p /smoke-test/dev /smoke-test/tmp/www
+    cp -a /dev/null /smoke-test/dev/null
+    echo "ok" > /smoke-test/tmp/www/index.html
+
+    chroot /smoke-test /bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /bin/ash -eu -c '
+        echo "--- ash"
+        # Debian is a merged-/usr distribution, so /bin is a symlink to /usr/bin and the applets installed by
+        # busybox are visible from /usr/bin which is earlier in the search path.
+        [ "$(command -v sh)" = "/usr/bin/sh" ]
+
+        echo "--- passwd"
+        [ "$(id -u)" = "0" ]
+        [ "$(id -un)" = "root" ]
+        [ -s /etc/passwd ]
+        [ -s /etc/group ]
+        [ -s /etc/nsswitch.conf ]
+        [ "$(echo foo | sed s/foo/bar/)" = "bar" ]
+        [ "$((6 * 7))" = "42" ]
+        [ "$(sh -c "echo nested")" = "nested" ]
+
+        echo "--- wget"
+        [ "$(command -v wget)" = "/usr/bin/wget" ]
+        wget --version | head -n 1 | grep -q "^GNU Wget"
+
+        echo "--- su-exec"
+        [ -x /sbin/su-exec ]
+        [ "$(/sbin/su-exec 0:0 /bin/id -u)" = "0" ]
+
+        echo "--- tls"
+        [ -s /etc/ssl/certs/ca-certificates.crt ]
+
+        httpd -f -p 127.0.0.1:8080 -h /tmp/www &
+        HTTPD_PID=$!
+        trap "kill ${HTTPD_PID}" EXIT
+        for i in 1 2 3 4 5; do wget -qO /dev/null http://127.0.0.1:8080/ && break; sleep 1; done
+
+        [ "$(wget -qO - http://127.0.0.1:8080/)" = "ok" ]
+        wget --quiet --no-check-certificate --tries=1 --spider http://127.0.0.1:8080/
+
+        echo "--- smoke tests passed"
+    '
+
+    rm -rf /smoke-test
+EOF
+
+FROM scratch
+
+COPY --link --from=assemble /root-fs /
